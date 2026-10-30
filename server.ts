@@ -22,6 +22,10 @@ const MODEL_NAME = process.env.GEMINI_MODEL || "gemini-3.1-flash-lite";
 // 免費層通常只允許每分鐘個位數~十幾次請求，
 // 這裡限制「同時間最多 N 個請求在飛」，避免瞬間炸開。
 const MAX_CONCURRENT = Number(process.env.GEMINI_MAX_CONCURRENT || 2);
+// 排隊中的請求上限，超過就直接回 429，避免大量請求卡在伺服器
+const MAX_QUEUE = Number(process.env.GEMINI_MAX_QUEUE || 20);
+// Gemini 支援的圖片格式
+const ALLOWED_MIME_TYPES = ["image/jpeg", "image/png", "image/webp", "image/heic", "image/heif"];
 let activeCount = 0;
 const queue: Array<() => void> = [];
 
@@ -187,13 +191,23 @@ async function startServer() {
   const app = express();
   const PORT = 3000;
 
-  app.use(express.json({ limit: "50mb" }));
+  // 前端會先把圖片縮到 1024px 的 JPEG，通常只有幾百 KB
+  app.use(express.json({ limit: "10mb" }));
 
   app.post("/api/analyze-slide", async (req, res) => {
     const { imageBase64, mimeType } = req.body;
 
     if (!imageBase64) {
       return res.status(400).json({ error: "No image provided" });
+    }
+    if (mimeType && !ALLOWED_MIME_TYPES.includes(mimeType)) {
+      return res.status(400).json({ error: `Unsupported image type: ${mimeType}` });
+    }
+    if (queue.length >= MAX_QUEUE) {
+      return res.status(429).json({
+        error: "伺服器忙碌中，請稍後再試",
+        retryAfterMs: 5000,
+      });
     }
 
     const deadline = Date.now() + MAX_TOTAL_WAIT_MS;
