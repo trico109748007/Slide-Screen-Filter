@@ -14,6 +14,7 @@ type ImageFile = {
   previewSrc: string;
   status: "idle" | "loading" | "success" | "error";
   decision: Decision | null;
+  reason: string | null;
   manual: boolean;
   errorMessage: string | null;
   rateLimitRetries: number;
@@ -198,6 +199,7 @@ export default function App() {
       previewSrc: URL.createObjectURL(file),
       status: "idle",
       decision: null,
+      reason: null,
       manual: false,
       errorMessage: null,
       rateLimitRetries: 0,
@@ -282,7 +284,7 @@ export default function App() {
         if (controller.signal.aborted) return;
 
         const decision: Decision = data.decision === "keep" || data.decision === "delete" ? data.decision : "unknown";
-        updateImage(item.id, { status: "success", decision });
+        updateImage(item.id, { status: "success", decision, reason: typeof data.reason === "string" ? data.reason : null });
       } catch (error) {
         // 清空列表時取消的請求，結果直接丟掉
         if (controller.signal.aborted) return;
@@ -353,8 +355,8 @@ export default function App() {
       img.status === "success" && img.decision ? DECISION_LABEL[img.decision] :
       img.status === "error" ? "錯誤" : "未完成";
     const rows = [
-      ["檔名", "判斷", "手動修正", "錯誤訊息"],
-      ...images.map(img => [img.file.name, statusLabel(img), img.manual ? "是" : "", img.errorMessage ?? ""]),
+      ["檔名", "判斷", "手動修正", "AI 判斷理由", "錯誤訊息"],
+      ...images.map(img => [img.file.name, statusLabel(img), img.manual ? "是" : "", img.reason ?? "", img.errorMessage ?? ""]),
     ];
     const csv = rows.map(row => row.map(csvCell).join(",")).join("\r\n");
     // 加上 BOM，Excel 開啟時中文才不會變亂碼
@@ -469,7 +471,7 @@ export default function App() {
                           animate={{ opacity: 1, scale: 1 }}
                           role={img.status === 'success' || img.status === 'error' ? 'button' : undefined}
                           tabIndex={img.status === 'success' || img.status === 'error' ? 0 : undefined}
-                          title={img.status === 'error' ? `${img.file.name}\n${img.errorMessage ?? ''}` : img.file.name}
+                          title={[img.file.name, img.status === 'error' ? img.errorMessage : img.reason].filter(Boolean).join('\n')}
                           onClick={() => handleTileClick(img)}
                           onKeyDown={e => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); handleTileClick(img); } }}
                           className={`relative rounded-lg ${img.status === 'success' || img.status === 'error' ? 'cursor-pointer' : ''} overflow-hidden border-2 aspect-video bg-black flex items-center justify-center ${
