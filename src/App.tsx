@@ -22,8 +22,7 @@ type ImageFile = {
   source: DecisionSource | null;
   reason: string | null;
   manual: boolean;
-  hash: string | null;
-  brightness: number | null;
+  thumb: Uint8Array | null;
   duplicateOf: string | null;
   errorMessage: string | null;
   rateLimitRetries: number;
@@ -45,13 +44,19 @@ const MAX_RATE_LIMIT_RETRIES = 3;
 const DEFAULT_PAUSE_MS = 15000;
 // 前端同時送出的請求數，與伺服器 GEMINI_MAX_CONCURRENT 的預設值一致
 const MAX_PARALLEL_REQUESTS = 2;
+// 只收瀏覽器能解碼的格式（HEIC 等格式在 canvas 預處理時會失敗）
+const ACCEPTED_TYPES = ["image/jpeg", "image/png", "image/webp"];
+// 每個請求最多包含幾張圖（伺服器上限 GEMINI_MAX_BATCH_SIZE 預設 10）
+const BATCH_SIZE = 5;
+// 本機分析用的灰階縮圖寬度（高度依原圖比例）
+const THUMB_WIDTH = 128;
 // 本機判定過場畫面：與平均亮度差超過 BLANK_PIXEL_DIFF 的像素比例低於 BLANK_MAX_RATIO，就視為單一顏色
 const BLANK_PIXEL_DIFF = 16;
 const BLANK_MAX_RATIO = 0.001;
-// 與前一張的感知雜湊（256 位元）差異不超過 DUPLICATE_MAX_DISTANCE、平均亮度差不超過
-// DUPLICATE_MAX_BRIGHTNESS_DIFF，就沿用前一張的判斷（雜湊只看明暗變化，需要亮度輔助）
-const DUPLICATE_MAX_DISTANCE = 10;
-const DUPLICATE_MAX_BRIGHTNESS_DIFF = 12;
+// 與前一張比較，亮度差超過 DUPLICATE_PIXEL_DIFF 的像素比例不超過 DUPLICATE_MAX_RATIO，就沿用前一張的判斷
+// （實測：同一張投影片加上螢幕分享提示條約 0.5%，同版型的不同投影片約 5% 以上）
+const DUPLICATE_PIXEL_DIFF = 32;
+const DUPLICATE_MAX_RATIO = 0.02;
 
 class ApiError extends Error {
   constructor(message: string, public status: number, public retryAfterMs: number | null) {
@@ -105,35 +110,23 @@ function grayscale(img: HTMLImageElement, width: number, height: number): Uint8A
   return gray;
 }
 
-// 判斷是否為單一顏色的過場畫面，並計算感知雜湊（dHash）供比對相似畫面
-async function analyzeLocally(file: File): Promise<{ blank: boolean; hash: string; brightness: number }> {
+// 產生灰階縮圖，並判斷是否為單一顏色的過場畫面
+async function analyzeLocally(file: File): Promise<{ blank: boolean; thumb: Uint8Array }> {
   const img = await loadImage(file);
+  const height = Math.max(1, Math.round((img.height * THUMB_WIDTH) / img.width));
+  const thumb = grayscale(img, THUMB_WIDTH, height);
 
-  const sampleWidth = 160;
-  const sampleHeight = Math.max(1, Math.round((img.height * sampleWidth) / img.width));
-  const gray = grayscale(img, sampleWidth, sampleHeight);
-  const mean = gray.reduce((sum, v) => sum + v, 0) / gray.length;
+  const mean = thumb.reduce((sum, v) => sum + v, 0) / thumb.length;
   let outliers = 0;
-  for (const v of gray) if (Math.abs(v - mean) > BLANK_PIXEL_DIFF) outliers++;
-  const blank = outliers / gray.length < BLANK_MAX_RATIO;
-
-  const small = grayscale(img, 17, 16);
-  let hash = "";
-  for (let y = 0; y < 16; y++) {
-    for (let x = 0; x < 16; x++) hash += small[y * 17 + x] < small[y * 17 + x + 1] ? "1" : "0";
-  }
-  return { blank, hash, brightness: mean };
+  for (const v of thumb) if (Math.abs(v - mean) > BLANK_PIXEL_DIFF) outliers++;
+  return { blank: outliers / thumb.length < BLANK_MAX_RATIO, thumb };
 }
 
-function isSimilar(a: { hash: string; brightness: number }, b: { hash: string; brightness: number }): boolean {
-  return hammingDistance(a.hash, b.hash) <= DUPLICATE_MAX_DISTANCE
-    && Math.abs(a.brightness - b.brightness) <= DUPLICATE_MAX_BRIGHTNESS_DIFF;
-}
-
-function hammingDistance(a: string, b: string): number {
-  let distance = 0;
-  for (let i = 0; i < a.length; i++) if (a[i] !== b[i]) distance++;
-  return distance;
+function isSimilar(a: Uint8Array, b: Uint8Array): boolean {
+  if (a.length !== b.length) return false;
+  let changed = 0;
+  for (let i = 0; i < a.length; i++) if (Math.abs(a[i] - b[i]) > DUPLICATE_PIXEL_DIFF) changed++;
+  return changed / a.length <= DUPLICATE_MAX_RATIO;
 }
 
 // ---------- 匯出（不使用外部套件） ----------
@@ -248,8 +241,10 @@ export default function App() {
   const [filter, setFilter] = useState<Filter>("all");
   const [isExporting, setIsExporting] = useState(false);
   const fileInputRef = useRef<HTMLInputElement>(null);
-  // 進行中的 AI 請求，key 為圖片 id
-  const controllersRef = useRef(new Map<string, AbortController>());
+  // 進行中的 AI 請求，key 為批次編號
+  const controllersRef = useRef(new Map<number, AbortController>());
+  const nextBatchIdRef = useRef(0);
+  const [aiRequestCount, setAiRequestCount] = useState(0);
   const localBusyRef = useRef(false);
   // 非同步工作結束時觸發佇列重新檢查
   const [localTick, setLocalTick] = useState(0);
@@ -257,6 +252,11 @@ export default function App() {
 
   const updateImage = (id: string, patch: Partial<ImageFile>) => {
     setImages(prev => prev.map(img => img.id === id ? { ...img, ...patch } : img));
+  };
+
+  const patchImages = (patches: Map<string, Partial<ImageFile>>) => {
+    if (patches.size === 0) return;
+    setImages(prev => prev.map(img => patches.has(img.id) ? { ...img, ...patches.get(img.id) } : img));
   };
 
   const handleFileChange = (e: React.ChangeEvent<HTMLInputElement>) => {
@@ -280,7 +280,7 @@ export default function App() {
 
   const processFiles = (newFiles: File[]) => {
     const imageFiles = newFiles
-      .filter(f => f.type.startsWith("image/"))
+      .filter(f => ACCEPTED_TYPES.includes(f.type))
       .sort((a, b) => a.name.localeCompare(b.name, undefined, { numeric: true }));
     if (imageFiles.length === 0) return;
 
@@ -293,8 +293,7 @@ export default function App() {
       source: null,
       reason: null,
       manual: false,
-      hash: null,
-      brightness: null,
+      thumb: null,
       duplicateOf: null,
       errorMessage: null,
       rateLimitRetries: 0,
@@ -344,17 +343,17 @@ export default function App() {
     if (index === -1) return;
     const item = images[index];
     // 往前找最近一張已分析、且不是過場畫面的圖來比對
-    const previous = images.slice(0, index).reverse().find(img => img.hash !== null && img.source !== "local");
+    const previous = images.slice(0, index).reverse().find(img => img.thumb !== null && img.source !== "local");
 
     localBusyRef.current = true;
     analyzeLocally(item.file)
-      .then(({ blank, hash, brightness }) => {
+      .then(({ blank, thumb }) => {
         if (blank) {
-          updateImage(item.id, { status: "success", decision: "delete", source: "local", reason: "本機判定：畫面幾乎是單一顏色（過場畫面）", hash, brightness });
-        } else if (previous?.hash && previous.brightness !== null && isSimilar({ hash, brightness }, { hash: previous.hash, brightness: previous.brightness })) {
-          updateImage(item.id, { status: "queued", hash, brightness, duplicateOf: previous.id });
+          updateImage(item.id, { status: "success", decision: "delete", source: "local", reason: "本機判定：畫面幾乎是單一顏色（過場畫面）", thumb });
+        } else if (previous?.thumb && isSimilar(thumb, previous.thumb)) {
+          updateImage(item.id, { status: "queued", thumb, duplicateOf: previous.id });
         } else {
-          updateImage(item.id, { status: "queued", hash, brightness });
+          updateImage(item.id, { status: "queued", thumb });
         }
       })
       .catch(error => {
@@ -379,21 +378,31 @@ export default function App() {
         updates.set(img.id, { duplicateOf: null });
       }
     }
-    if (updates.size > 0) {
-      setImages(prev => prev.map(img => updates.has(img.id) ? { ...img, ...updates.get(img.id) } : img));
-    }
+    patchImages(updates);
   }, [images]);
 
-  const analyzeWithApi = async (item: ImageFile, controller: AbortController) => {
+  const analyzeBatch = async (batch: ImageFile[], batchId: number, controller: AbortController) => {
+    const patches = new Map<string, Partial<ImageFile>>();
+    const sent: ImageFile[] = [];
     try {
-      const base64DataUrl = await preprocessImage(item.file);
-      const base64Data = base64DataUrl.split(",")[1];
-      const mimeType = "image/jpeg";
+      // 個別圖片讀取失敗只標記該張，其餘照常送出
+      const prepared = await Promise.allSettled(batch.map(item => preprocessImage(item.file)));
+      const payload: { imageBase64: string; mimeType: string }[] = [];
+      prepared.forEach((result, i) => {
+        if (result.status === "fulfilled") {
+          sent.push(batch[i]);
+          payload.push({ imageBase64: result.value.split(",")[1], mimeType: "image/jpeg" });
+        } else {
+          patches.set(batch[i].id, { status: "error", errorMessage: "無法讀取圖片" });
+        }
+      });
+      if (payload.length === 0) return;
 
-      const response = await fetch("/api/analyze-slide", {
+      setAiRequestCount(c => c + 1);
+      const response = await fetch("/api/analyze-slides", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ imageBase64: base64Data, mimeType }),
+        body: JSON.stringify({ images: payload }),
         signal: controller.signal,
       });
 
@@ -404,42 +413,58 @@ export default function App() {
       }
       if (controller.signal.aborted) return;
 
-      const decision: Decision = data.decision === "keep" || data.decision === "delete" ? data.decision : "unknown";
-      updateImage(item.id, { status: "success", decision, source: "ai", reason: typeof data.reason === "string" ? data.reason : null });
+      sent.forEach((item, i) => {
+        const result = data.results?.[i];
+        const decision: Decision = result?.decision === "keep" || result?.decision === "delete" ? result.decision : "unknown";
+        patches.set(item.id, { status: "success", decision, source: "ai", reason: typeof result?.reason === "string" ? result.reason : null });
+      });
     } catch (error) {
       // 清空列表時取消的請求，結果直接丟掉
       if (controller.signal.aborted) return;
-      // 速率限制：整批暫停一段時間，這張放回佇列稍後重送
-      if (error instanceof ApiError && error.status === 429 && item.rateLimitRetries < MAX_RATE_LIMIT_RETRIES) {
+      const message = error instanceof Error ? error.message : "Error";
+      // 速率限制：整批暫停一段時間，這批放回佇列稍後重送
+      if (error instanceof ApiError && error.status === 429) {
         setPausedUntil(Date.now() + (error.retryAfterMs ?? DEFAULT_PAUSE_MS));
-        updateImage(item.id, { status: "queued", rateLimitRetries: item.rateLimitRetries + 1 });
-        return;
+        for (const item of sent) {
+          patches.set(item.id, item.rateLimitRetries < MAX_RATE_LIMIT_RETRIES
+            ? { status: "queued", rateLimitRetries: item.rateLimitRetries + 1 }
+            : { status: "error", errorMessage: message });
+        }
+      } else {
+        for (const item of sent) patches.set(item.id, { status: "error", errorMessage: message });
       }
-      updateImage(item.id, { status: "error", errorMessage: error instanceof Error ? error.message : "Error" });
     } finally {
-      if (controllersRef.current.get(item.id) === controller) {
-        controllersRef.current.delete(item.id);
+      if (!controller.signal.aborted) patchImages(patches);
+      if (controllersRef.current.get(batchId) === controller) {
+        controllersRef.current.delete(batchId);
         setApiTick(t => t + 1);
       }
     }
   };
 
-  // 第三階段：送 AI 分析，最多同時 MAX_PARALLEL_REQUESTS 個請求
+  // 第三階段：送 AI 分析，每個請求最多 BATCH_SIZE 張，最多同時 MAX_PARALLEL_REQUESTS 個請求
   useEffect(() => {
     if (pausedUntil !== null) return;
     const slots = MAX_PARALLEL_REQUESTS - controllersRef.current.size;
     if (slots <= 0) return;
-    const ready = images
-      .filter(img => img.status === "queued" && !img.duplicateOf && !controllersRef.current.has(img.id))
-      .slice(0, slots);
-    if (ready.length === 0) return;
+    const ready = images.filter(img => img.status === "queued" && !img.duplicateOf);
+    // 本機分析還沒跑完時，湊滿一批再送，減少請求次數
+    const localPending = images.some(img => img.status === "idle");
+    const batches: ImageFile[][] = [];
+    for (let i = 0; i < ready.length && batches.length < slots; i += BATCH_SIZE) {
+      const batch = ready.slice(i, i + BATCH_SIZE);
+      if (batch.length < BATCH_SIZE && localPending) break;
+      batches.push(batch);
+    }
+    if (batches.length === 0) return;
 
-    const ids = new Set(ready.map(img => img.id));
+    const ids = new Set(batches.flat().map(img => img.id));
     setImages(prev => prev.map(img => ids.has(img.id) ? { ...img, status: "loading" } : img));
-    for (const item of ready) {
+    for (const batch of batches) {
+      const batchId = nextBatchIdRef.current++;
       const controller = new AbortController();
-      controllersRef.current.set(item.id, controller);
-      analyzeWithApi(item, controller);
+      controllersRef.current.set(batchId, controller);
+      analyzeBatch(batch, batchId, controller);
     }
   }, [images, pausedUntil, apiTick]);
 
@@ -450,12 +475,13 @@ export default function App() {
     setImages([]);
     setPausedUntil(null);
     setFilter("all");
+    setAiRequestCount(0);
   };
 
   // 本機分析已完成的圖直接重送 AI，否則從本機分析重新開始
   const retryPatch = (img: ImageFile): ImageFile => ({
     ...img,
-    status: img.hash ? "queued" : "idle",
+    status: img.thumb ? "queued" : "idle",
     duplicateOf: null,
     errorMessage: null,
     rateLimitRetries: 0,
@@ -521,6 +547,11 @@ export default function App() {
     deleted: images.filter(i => i.decision === 'delete').length,
     unknown: images.filter(i => i.decision === 'unknown').length,
     errors: images.filter(i => i.status === 'error').length,
+    bySource: {
+      local: images.filter(i => i.source === 'local').length,
+      duplicate: images.filter(i => i.source === 'duplicate').length,
+      ai: images.filter(i => i.source === 'ai').length,
+    },
   };
 
   const isProcessing = stats.processing > 0 && pausedUntil === null;
@@ -532,7 +563,7 @@ export default function App() {
           <div className="w-8 h-8 bg-blue-600 rounded flex items-center justify-center">
             <div className="w-4 h-4 border-2 border-white"></div>
           </div>
-          <h1 className="text-xl font-bold text-slate-800 tracking-tight">簡報畫面篩選助手 <span className="hidden md:inline text-slate-400 font-normal text-sm ml-2">v2.4.1 (Batch)</span></h1>
+          <h1 className="text-xl font-bold text-slate-800 tracking-tight">簡報畫面篩選助手</h1>
         </div>
         <div className="flex items-center gap-6">
           <div className="flex items-center gap-2">
@@ -561,14 +592,14 @@ export default function App() {
                   點擊或拖曳多張圖片至此
                 </h3>
                 <p className="text-slate-500 text-sm mb-4 text-center max-w-md">
-                  支援批次上傳。圖片將會在本機進行壓縮預處理，接著分批傳送至 AI 進行判斷。
+                  支援批次上傳。過場畫面與相似畫面會先在本機判定，其餘圖片壓縮後分批傳送至 AI 判斷。
                 </p>
-                <p className="text-slate-400 text-xs">支援 JPG, PNG 格式</p>
+                <p className="text-slate-400 text-xs">支援 JPG、PNG、WebP 格式</p>
                 <input
                   ref={fileInputRef}
                   type="file"
                   multiple
-                  accept="image/*"
+                  accept={ACCEPTED_TYPES.join(",")}
                   className="hidden"
                   onChange={handleFileChange}
                 />
@@ -587,7 +618,7 @@ export default function App() {
                     ref={fileInputRef}
                     type="file"
                     multiple
-                    accept="image/*"
+                    accept={ACCEPTED_TYPES.join(",")}
                     className="hidden"
                     onChange={handleFileChange}
                   />
@@ -761,7 +792,8 @@ export default function App() {
               <ul className="text-xs space-y-2 opacity-90">
                 <li className="flex gap-2">• 完整、放映模式內容 → <span className="font-bold underline">保留</span></li>
                 <li className="flex gap-2">• 編輯工具、視訊視窗 → <span className="font-bold underline">刪除</span></li>
-                <li className="flex gap-2">• 全黑/全灰過場畫面 → <span className="font-bold underline">刪除</span></li>
+                <li className="flex gap-2">• 全黑/全灰過場畫面 → <span className="font-bold underline">刪除</span>（本機判定）</li>
+                <li className="flex gap-2">• 與前一張相似 → 沿用前一張的判斷</li>
               </ul>
             </div>
           </div>
@@ -770,11 +802,12 @@ export default function App() {
 
       <footer className="hidden md:flex h-12 bg-slate-100 border-t border-slate-200 px-8 items-center justify-between text-[11px] text-slate-500 shrink-0">
         <div className="flex gap-4">
-          <span>SYSTEM: OK</span>
-          <span>MEM: STABLE</span>
+          <span>本機判定 {stats.bySource.local}</span>
+          <span>沿用 {stats.bySource.duplicate}</span>
+          <span>AI 判斷 {stats.bySource.ai}</span>
         </div>
         <div className="flex gap-4">
-          <span>AI STUDIO PREVIEW</span>
+          <span>AI 請求 {aiRequestCount} 次</span>
         </div>
       </footer>
     </div>
