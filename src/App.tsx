@@ -3,7 +3,7 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 import React, { useState, useRef, useEffect } from "react";
-import { Upload, AlertCircle, XCircle, RotateCcw } from "lucide-react";
+import { Upload, AlertCircle, XCircle, RotateCcw, Download, FileText } from "lucide-react";
 import { motion, AnimatePresence } from "motion/react";
 
 type Decision = "keep" | "delete" | "unknown";
@@ -48,11 +48,118 @@ const DECISION_LABEL: Record<Decision, string> = {
 
 let nextImageId = 0;
 
+// ---------- 匯出（不使用外部套件） ----------
+const CRC_TABLE = (() => {
+  const table = new Uint32Array(256);
+  for (let n = 0; n < 256; n++) {
+    let c = n;
+    for (let k = 0; k < 8; k++) c = c & 1 ? 0xedb88320 ^ (c >>> 1) : c >>> 1;
+    table[n] = c >>> 0;
+  }
+  return table;
+})();
+
+function crc32(data: Uint8Array): number {
+  let crc = 0xffffffff;
+  for (let i = 0; i < data.length; i++) crc = CRC_TABLE[(crc ^ data[i]) & 0xff] ^ (crc >>> 8);
+  return (crc ^ 0xffffffff) >>> 0;
+}
+
+// 只打包不壓縮（store），圖片本身已壓縮過，不需要再壓
+async function buildZip(files: File[]): Promise<Blob> {
+  const encoder = new TextEncoder();
+  const parts: BlobPart[] = [];
+  const central: Uint8Array[] = [];
+  const usedNames = new Set<string>();
+  let offset = 0;
+
+  for (const file of files) {
+    // 同名檔案加上 (2)、(3)… 避免解壓時互相覆蓋
+    let name = file.name;
+    for (let i = 2; usedNames.has(name); i++) {
+      const dot = file.name.lastIndexOf(".");
+      name = dot > 0 ? `${file.name.slice(0, dot)} (${i})${file.name.slice(dot)}` : `${file.name} (${i})`;
+    }
+    usedNames.add(name);
+
+    const data = new Uint8Array(await file.arrayBuffer());
+    const nameBytes = encoder.encode(name);
+    const crc = crc32(data);
+    const d = new Date(file.lastModified || Date.now());
+    const dosTime = (d.getHours() << 11) | (d.getMinutes() << 5) | (d.getSeconds() >> 1);
+    const dosDate = ((Math.max(d.getFullYear(), 1980) - 1980) << 9) | ((d.getMonth() + 1) << 5) | d.getDate();
+
+    const local = new DataView(new ArrayBuffer(30));
+    local.setUint32(0, 0x04034b50, true);
+    local.setUint16(4, 20, true);
+    local.setUint16(6, 0x0800, true); // 檔名使用 UTF-8
+    local.setUint16(8, 0, true);
+    local.setUint16(10, dosTime, true);
+    local.setUint16(12, dosDate, true);
+    local.setUint32(14, crc, true);
+    local.setUint32(18, data.length, true);
+    local.setUint32(22, data.length, true);
+    local.setUint16(26, nameBytes.length, true);
+    local.setUint16(28, 0, true);
+
+    const entry = new DataView(new ArrayBuffer(46));
+    entry.setUint32(0, 0x02014b50, true);
+    entry.setUint16(4, 20, true);
+    entry.setUint16(6, 20, true);
+    entry.setUint16(8, 0x0800, true);
+    entry.setUint16(10, 0, true);
+    entry.setUint16(12, dosTime, true);
+    entry.setUint16(14, dosDate, true);
+    entry.setUint32(16, crc, true);
+    entry.setUint32(20, data.length, true);
+    entry.setUint32(24, data.length, true);
+    entry.setUint16(28, nameBytes.length, true);
+    entry.setUint32(42, offset, true);
+    central.push(new Uint8Array(entry.buffer), nameBytes);
+
+    parts.push(local.buffer, nameBytes, data);
+    offset += 30 + nameBytes.length + data.length;
+  }
+
+  const centralSize = central.reduce((sum, b) => sum + b.length, 0);
+  const end = new DataView(new ArrayBuffer(22));
+  end.setUint32(0, 0x06054b50, true);
+  end.setUint16(8, files.length, true);
+  end.setUint16(10, files.length, true);
+  end.setUint32(12, centralSize, true);
+  end.setUint32(16, offset, true);
+
+  return new Blob([...parts, ...central, end.buffer], { type: "application/zip" });
+}
+
+// 下載檔名用英文：部分瀏覽器遇到非 ASCII 檔名會改成 "download"
+function downloadBlob(blob: Blob, filename: string) {
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement("a");
+  a.href = url;
+  a.download = filename;
+  document.body.appendChild(a);
+  a.click();
+  a.remove();
+  setTimeout(() => URL.revokeObjectURL(url), 1000);
+}
+
+function csvCell(value: string): string {
+  return /[",\r\n]/.test(value) ? `"${value.replace(/"/g, '""')}"` : value;
+}
+
+function timestamp(): string {
+  const d = new Date();
+  const pad = (n: number) => String(n).padStart(2, "0");
+  return `${d.getFullYear()}${pad(d.getMonth() + 1)}${pad(d.getDate())}-${pad(d.getHours())}${pad(d.getMinutes())}`;
+}
+
 export default function App() {
   const [images, setImages] = useState<ImageFile[]>([]);
   const [isProcessing, setIsProcessing] = useState(false);
   const [pausedUntil, setPausedUntil] = useState<number | null>(null);
   const [filter, setFilter] = useState<Filter>("all");
+  const [isExporting, setIsExporting] = useState(false);
   const fileInputRef = useRef<HTMLInputElement>(null);
   const abortRef = useRef<AbortController | null>(null);
 
@@ -225,6 +332,33 @@ export default function App() {
   const handleTileClick = (img: ImageFile) => {
     if (img.status === "success") toggleDecision(img.id);
     else if (img.status === "error") retryImage(img.id);
+  };
+
+  const exportZip = async () => {
+    const kept = images.filter(img => img.status === "success" && img.decision === "keep");
+    if (kept.length === 0) return;
+    setIsExporting(true);
+    try {
+      const zip = await buildZip(kept.map(img => img.file));
+      downloadBlob(zip, `slides-keep-${timestamp()}.zip`);
+    } catch (error) {
+      alert(`打包失敗：${error instanceof Error ? error.message : error}`);
+    } finally {
+      setIsExporting(false);
+    }
+  };
+
+  const exportCsv = () => {
+    const statusLabel = (img: ImageFile) =>
+      img.status === "success" && img.decision ? DECISION_LABEL[img.decision] :
+      img.status === "error" ? "錯誤" : "未完成";
+    const rows = [
+      ["檔名", "判斷", "手動修正", "錯誤訊息"],
+      ...images.map(img => [img.file.name, statusLabel(img), img.manual ? "是" : "", img.errorMessage ?? ""]),
+    ];
+    const csv = rows.map(row => row.map(csvCell).join(",")).join("\r\n");
+    // 加上 BOM，Excel 開啟時中文才不會變亂碼
+    downloadBlob(new Blob(["\ufeff" + csv], { type: "text/csv;charset=utf-8" }), `slide-filter-results-${timestamp()}.csv`);
   };
 
   const visibleImages = images.filter(img =>
@@ -435,6 +569,29 @@ export default function App() {
 
               <div className="mt-auto">
                 <div className="h-px bg-slate-100 w-full mb-6"></div>
+                {stats.processing > 0 && stats.total > 0 && (
+                  <p className="text-xs text-slate-400 text-center mb-2">還有 {stats.processing} 張未完成，現在匯出只會包含已完成的結果</p>
+                )}
+                <div className="grid grid-cols-2 gap-3 mb-3">
+                  <button
+                    type="button"
+                    onClick={exportZip}
+                    disabled={stats.retained === 0 || isExporting}
+                    className="py-3 bg-green-600 text-white text-sm font-bold rounded-lg hover:bg-green-700 transition-colors disabled:opacity-50 disabled:cursor-not-allowed flex items-center justify-center gap-2"
+                  >
+                    <Download className="w-4 h-4" />
+                    {isExporting ? '打包中…' : `下載保留 (${stats.retained})`}
+                  </button>
+                  <button
+                    type="button"
+                    onClick={exportCsv}
+                    disabled={images.length === 0}
+                    className="py-3 bg-white text-slate-700 border border-slate-300 text-sm font-bold rounded-lg hover:bg-slate-50 transition-colors disabled:opacity-50 disabled:cursor-not-allowed flex items-center justify-center gap-2"
+                  >
+                    <FileText className="w-4 h-4" />
+                    匯出 CSV
+                  </button>
+                </div>
                 <button
                   onClick={reset}
                   disabled={images.length === 0}
