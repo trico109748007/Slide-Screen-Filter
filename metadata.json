@@ -1,0 +1,6 @@
+{
+  "name": "Slide Screen Filter",
+  "description": "Analyzes an uploaded image to determine if it is a complete presentation slide or another kind of interface, returning specific tags.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
