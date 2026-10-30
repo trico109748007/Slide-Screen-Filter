@@ -129,7 +129,6 @@ async function generateWithRetry(contents: any, deadline: number) {
         model: MODEL_NAME,
         contents,
         config: {
-          temperature: 0,
           responseMimeType: "application/json",
           responseSchema: RESPONSE_SCHEMA,
         },
@@ -204,7 +203,15 @@ async function startServer() {
         });
       }
 
-      res.status(500).json({ error: "Failed to analyze image" });
+      // 把 Google 回傳的錯誤摘要帶給前端，不用翻伺服器日誌也看得到原因
+      const body = parseErrorBody(error)?.error;
+      const detail = body
+        ? `${body.code ?? error?.status ?? ""} ${body.status ?? ""} ${body.message ?? ""}`
+        : error?.message;
+      res.status(500).json({
+        error: "Failed to analyze image",
+        detail: String(detail || "").trim().slice(0, 300),
+      });
     } finally {
       releaseSlot();
     }

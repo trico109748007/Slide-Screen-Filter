@@ -3,7 +3,7 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 import React, { useState, useRef, useEffect } from "react";
-import { Upload, AlertCircle, XCircle } from "lucide-react";
+import { Upload, AlertCircle, XCircle, RotateCcw } from "lucide-react";
 import { motion, AnimatePresence } from "motion/react";
 
 type Decision = "keep" | "delete" | "unknown";
@@ -14,8 +14,31 @@ type ImageFile = {
   previewSrc: string;
   status: "idle" | "loading" | "success" | "error";
   decision: Decision | null;
+  manual: boolean;
   errorMessage: string | null;
+  rateLimitRetries: number;
 };
+
+type Filter = "all" | Decision | "error";
+
+const FILTER_LABEL: Record<Filter, string> = {
+  all: "全部",
+  keep: "保留",
+  delete: "刪除",
+  unknown: "待確認",
+  error: "錯誤",
+};
+
+// 同一張圖遇到速率限制最多自動重排幾次，超過就標成錯誤（例如每日額度用完）
+const MAX_RATE_LIMIT_RETRIES = 3;
+// 伺服器沒給建議等待時間時的預設暫停時間
+const DEFAULT_PAUSE_MS = 15000;
+
+class ApiError extends Error {
+  constructor(message: string, public status: number, public retryAfterMs: number | null) {
+    super(message);
+  }
+}
 
 const DECISION_LABEL: Record<Decision, string> = {
   keep: "保留",
@@ -28,6 +51,8 @@ let nextImageId = 0;
 export default function App() {
   const [images, setImages] = useState<ImageFile[]>([]);
   const [isProcessing, setIsProcessing] = useState(false);
+  const [pausedUntil, setPausedUntil] = useState<number | null>(null);
+  const [filter, setFilter] = useState<Filter>("all");
   const fileInputRef = useRef<HTMLInputElement>(null);
   const abortRef = useRef<AbortController | null>(null);
 
@@ -55,7 +80,9 @@ export default function App() {
   };
 
   const processFiles = (newFiles: File[]) => {
-    const imageFiles = newFiles.filter(f => f.type.startsWith("image/"));
+    const imageFiles = newFiles
+      .filter(f => f.type.startsWith("image/"))
+      .sort((a, b) => a.name.localeCompare(b.name, undefined, { numeric: true }));
     if (imageFiles.length === 0) return;
 
     const newItems: ImageFile[] = imageFiles.map(file => ({
@@ -64,7 +91,9 @@ export default function App() {
       previewSrc: URL.createObjectURL(file),
       status: "idle",
       decision: null,
+      manual: false,
       errorMessage: null,
+      rateLimitRetries: 0,
     }));
 
     setImages(prev => [...prev, ...newItems]);
@@ -108,8 +137,15 @@ export default function App() {
     });
   };
 
+  // 速率限制暫停時間到了就恢復處理
   useEffect(() => {
-    if (isProcessing) return;
+    if (pausedUntil === null) return;
+    const timer = setTimeout(() => setPausedUntil(null), Math.max(0, pausedUntil - Date.now()));
+    return () => clearTimeout(timer);
+  }, [pausedUntil]);
+
+  useEffect(() => {
+    if (isProcessing || pausedUntil !== null) return;
     const item = images.find(img => img.status === "idle");
     if (!item) return;
 
@@ -131,8 +167,11 @@ export default function App() {
           signal: controller.signal,
         });
 
-        if (!response.ok) throw new Error("API Error");
-        const data = await response.json();
+        const data = await response.json().catch(() => ({}));
+        if (!response.ok) {
+          const message = [data.error, data.detail].filter(Boolean).join("：") || `HTTP ${response.status}`;
+          throw new ApiError(message, response.status, data.retryAfterMs ?? null);
+        }
         if (controller.signal.aborted) return;
 
         const decision: Decision = data.decision === "keep" || data.decision === "delete" ? data.decision : "unknown";
@@ -140,6 +179,12 @@ export default function App() {
       } catch (error) {
         // 清空列表時取消的請求，結果直接丟掉
         if (controller.signal.aborted) return;
+        // 速率限制：整批暫停一段時間，這張放回佇列稍後重送
+        if (error instanceof ApiError && error.status === 429 && item.rateLimitRetries < MAX_RATE_LIMIT_RETRIES) {
+          setPausedUntil(Date.now() + (error.retryAfterMs ?? DEFAULT_PAUSE_MS));
+          updateImage(item.id, { status: "idle", rateLimitRetries: item.rateLimitRetries + 1 });
+          return;
+        }
         updateImage(item.id, { status: "error", errorMessage: error instanceof Error ? error.message : "Error" });
       } finally {
         if (abortRef.current === controller) {
@@ -150,14 +195,43 @@ export default function App() {
     };
 
     processItem();
-  }, [images, isProcessing]);
+  }, [images, isProcessing, pausedUntil]);
 
   const reset = () => {
     abortRef.current?.abort();
     abortRef.current = null;
+    images.forEach(img => URL.revokeObjectURL(img.previewSrc));
     setImages([]);
     setIsProcessing(false);
+    setPausedUntil(null);
+    setFilter("all");
   };
+
+  const retryImage = (id: string) => {
+    updateImage(id, { status: "idle", errorMessage: null, rateLimitRetries: 0 });
+  };
+
+  const retryFailed = () => {
+    setImages(prev => prev.map(img => img.status === "error" ? { ...img, status: "idle", errorMessage: null, rateLimitRetries: 0 } : img));
+  };
+
+  // 手動修正判斷：保留 ↔ 刪除，待確認點一下先改成保留
+  const toggleDecision = (id: string) => {
+    setImages(prev => prev.map(img => img.id === id && img.status === "success"
+      ? { ...img, decision: img.decision === "keep" ? "delete" : "keep", manual: true }
+      : img));
+  };
+
+  const handleTileClick = (img: ImageFile) => {
+    if (img.status === "success") toggleDecision(img.id);
+    else if (img.status === "error") retryImage(img.id);
+  };
+
+  const visibleImages = images.filter(img =>
+    filter === "all" ? true :
+    filter === "error" ? img.status === "error" :
+    img.status === "success" && img.decision === filter
+  );
 
   const stats = {
     total: images.length,
@@ -179,8 +253,8 @@ export default function App() {
         </div>
         <div className="flex items-center gap-6">
           <div className="flex items-center gap-2">
-            <span className={`w-2 h-2 rounded-full ${isProcessing ? 'bg-blue-500 animate-pulse' : 'bg-green-500'}`}></span>
-            <span className="text-sm font-medium text-slate-600 hidden md:inline">{isProcessing ? '批次分析中' : '系統就緒'}</span>
+            <span className={`w-2 h-2 rounded-full ${isProcessing ? 'bg-blue-500 animate-pulse' : pausedUntil !== null ? 'bg-yellow-400 animate-pulse' : 'bg-green-500'}`}></span>
+            <span className="text-sm font-medium text-slate-600 hidden md:inline">{isProcessing ? '批次分析中' : pausedUntil !== null ? '速率限制，稍後自動繼續' : '系統就緒'}</span>
           </div>
         </div>
       </header>
@@ -237,14 +311,34 @@ export default function App() {
                 </div>
                 
                 <div className="flex-1 bg-white rounded-xl border border-slate-200 p-4 shadow-sm overflow-auto min-h-[400px]">
+                  <div className="flex flex-wrap items-center gap-2 mb-4">
+                    {(Object.keys(FILTER_LABEL) as Filter[]).map(key => (
+                      <button
+                        key={key}
+                        type="button"
+                        onClick={() => setFilter(key)}
+                        className={`text-xs font-bold px-3 py-1 rounded-full border transition-colors ${
+                          filter === key ? 'bg-slate-900 text-white border-slate-900' : 'bg-white text-slate-600 border-slate-200 hover:bg-slate-50'
+                        }`}
+                      >
+                        {FILTER_LABEL[key]}
+                      </button>
+                    ))}
+                    <span className="text-xs text-slate-400 ml-auto">點縮圖可切換保留／刪除，錯誤的圖點一下重試</span>
+                  </div>
                   <div className="grid grid-cols-2 md:grid-cols-3 lg:grid-cols-4 gap-4">
                     <AnimatePresence>
-                      {images.map(img => (
+                      {visibleImages.map(img => (
                         <motion.div 
                           key={img.id}
                           initial={{ opacity: 0, scale: 0.9 }}
                           animate={{ opacity: 1, scale: 1 }}
-                          className={`relative rounded-lg overflow-hidden border-2 aspect-video bg-black flex items-center justify-center ${
+                          role={img.status === 'success' || img.status === 'error' ? 'button' : undefined}
+                          tabIndex={img.status === 'success' || img.status === 'error' ? 0 : undefined}
+                          title={img.status === 'error' ? `${img.file.name}\n${img.errorMessage ?? ''}` : img.file.name}
+                          onClick={() => handleTileClick(img)}
+                          onKeyDown={e => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); handleTileClick(img); } }}
+                          className={`relative rounded-lg ${img.status === 'success' || img.status === 'error' ? 'cursor-pointer' : ''} overflow-hidden border-2 aspect-video bg-black flex items-center justify-center ${
                             img.status === 'success' && img.decision === 'keep' ? 'border-green-500' :
                             img.status === 'success' && img.decision === 'delete' ? 'border-red-500' :
                             img.status === 'success' && img.decision === 'unknown' ? 'border-yellow-400' :
@@ -252,7 +346,7 @@ export default function App() {
                             'border-slate-200'
                           }`}
                         >
-                          <img src={img.previewSrc} className="w-full h-full object-cover opacity-60" />
+                          <img src={img.previewSrc} alt={img.file.name} className="w-full h-full object-cover opacity-60" />
                           
                           <div className="absolute inset-0 flex items-center justify-center p-2">
                             {img.status === 'idle' && (
@@ -267,11 +361,14 @@ export default function App() {
                                 img.decision === 'delete' ? 'bg-red-500/90 text-white' :
                                 'bg-yellow-400/90 text-slate-900'
                               }`}>
-                                {DECISION_LABEL[img.decision]}
+                                {DECISION_LABEL[img.decision]}{img.manual && <span className="ml-1 text-[10px] font-normal opacity-80">手動</span>}
                               </span>
                             )}
                             {img.status === 'error' && (
-                              <AlertCircle className="text-orange-500 w-8 h-8" />
+                              <div className="flex flex-col items-center gap-1 text-center">
+                                <AlertCircle className="text-orange-500 w-8 h-8" />
+                                <span className="text-[10px] leading-tight text-white bg-slate-900/70 px-1.5 py-0.5 rounded line-clamp-2">{img.errorMessage}</span>
+                              </div>
                             )}
                           </div>
                         </motion.div>
@@ -313,6 +410,17 @@ export default function App() {
                     {stats.unknown > 0 && <span className="text-yellow-600">待確認 {stats.unknown}</span>}
                     {stats.errors > 0 && <span className="text-orange-500">錯誤 {stats.errors}</span>}
                   </div>
+                )}
+
+                {stats.errors > 0 && (
+                  <button
+                    type="button"
+                    onClick={retryFailed}
+                    className="w-full mb-4 py-2 bg-orange-50 text-orange-600 border border-orange-200 text-sm font-bold rounded-lg hover:bg-orange-100 transition-colors flex items-center justify-center gap-2"
+                  >
+                    <RotateCcw className="w-4 h-4" />
+                    重試失敗項目 ({stats.errors})
+                  </button>
                 )}
 
                 <div className="w-full bg-slate-100 h-2 rounded-full overflow-hidden mb-6">
