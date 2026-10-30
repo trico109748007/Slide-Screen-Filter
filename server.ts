@@ -24,6 +24,8 @@ const MODEL_NAME = process.env.GEMINI_MODEL || "gemini-3.1-flash-lite";
 const MAX_CONCURRENT = Number(process.env.GEMINI_MAX_CONCURRENT || 2);
 // 排隊中的請求上限，超過就直接回 429，避免大量請求卡在伺服器
 const MAX_QUEUE = Number(process.env.GEMINI_MAX_QUEUE || 20);
+// 單次請求最多幾張圖（前端預設一次送 5 張）
+const MAX_BATCH_SIZE = Number(process.env.GEMINI_MAX_BATCH_SIZE || 10);
 // Gemini 支援的圖片格式
 const ALLOWED_MIME_TYPES = ["image/jpeg", "image/png", "image/webp", "image/heic", "image/heif"];
 let activeCount = 0;
@@ -98,18 +100,28 @@ const MAX_RETRIES = Number(process.env.GEMINI_MAX_RETRIES || 4);
 // 單一請求（含排隊與重試等待）的總時間上限，超過就直接回 429，避免 HTTP 請求逾時
 const MAX_TOTAL_WAIT_MS = Number(process.env.GEMINI_MAX_TOTAL_WAIT_MS || 60000);
 
-// 要求模型只回傳 keep / delete，避免自由文字造成判斷錯誤；reason 放前面，讓模型先說明再下結論
+// 要求模型逐張回傳 keep / delete，避免自由文字造成判斷錯誤；reason 放前面，讓模型先說明再下結論
 const RESPONSE_SCHEMA = {
   type: Type.OBJECT,
   properties: {
-    reason: { type: Type.STRING },
-    decision: { type: Type.STRING, enum: ["keep", "delete"] },
+    results: {
+      type: Type.ARRAY,
+      items: {
+        type: Type.OBJECT,
+        properties: {
+          index: { type: Type.INTEGER },
+          reason: { type: Type.STRING },
+          decision: { type: Type.STRING, enum: ["keep", "delete"] },
+        },
+        required: ["index", "reason", "decision"],
+        propertyOrdering: ["index", "reason", "decision"],
+      },
+    },
   },
-  required: ["reason", "decision"],
-  propertyOrdering: ["reason", "decision"],
+  required: ["results"],
 };
 
-const PROMPT = `你是簡報截圖篩選助手。請判斷這張截圖是否以「投影片內容」為主體。
+const PROMPT = `你是簡報截圖篩選助手。以下有多張截圖，每張前面標有編號。請逐張「獨立」判斷是否以「投影片內容」為主體，不要互相參考。
 
 保留（keep）：投影片內容佔畫面主要部分。即使畫面上同時出現以下元素，也要保留：
 - 放映視窗的標題列、視窗按鈕或邊框（沒有全螢幕放映）
@@ -123,27 +135,31 @@ const PROMPT = `你是簡報截圖篩選助手。請判斷這張截圖是否以�
 - 幾乎沒有內容的過場畫面：全黑、全灰、全白、載入中
 
 判斷原則：視窗標題列、分享提示這類元素本身不構成刪除理由。無法確定時，傾向保留。
-reason 請用一句繁體中文簡述判斷依據。`;
+results 每張圖一筆，index 為該圖的編號；reason 請用一句繁體中文簡述判斷依據。`;
 
 type Decision = "keep" | "delete" | "unknown";
 
-function parseDecision(text: string | undefined): { decision: Decision; reason: string } {
-  const raw = text?.trim() || "";
+// 依編號把模型回傳的結果對應回每張圖；漏回或格式錯誤的標成 unknown
+function parseResults(text: string | undefined, count: number): { decision: Decision; reason: string }[] {
+  const results: { decision: Decision; reason: string }[] = Array.from({ length: count }, () => ({
+    decision: "unknown",
+    reason: "AI 沒有回傳這張的結果",
+  }));
   try {
-    const parsed = JSON.parse(raw);
-    const reason = typeof parsed?.reason === "string" ? parsed.reason.slice(0, 200) : "";
-    if (parsed?.decision === "keep" || parsed?.decision === "delete") {
-      return { decision: parsed.decision, reason };
+    const parsed = JSON.parse(text?.trim() || "");
+    for (const item of parsed?.results ?? []) {
+      const i = Number(item?.index) - 1;
+      if (!Number.isInteger(i) || i < 0 || i >= count) continue;
+      if (item.decision !== "keep" && item.decision !== "delete") continue;
+      results[i] = {
+        decision: item.decision,
+        reason: typeof item.reason === "string" ? item.reason.slice(0, 200) : "",
+      };
     }
   } catch {
-    // 不是 JSON，改用關鍵字判斷
+    // 不是 JSON，全部維持 unknown
   }
-  const hasKeep = /保留|keep/i.test(raw);
-  const hasDelete = /刪除|delete/i.test(raw);
-  const reason = raw.slice(0, 200);
-  if (hasKeep && !hasDelete) return { decision: "keep", reason };
-  if (hasDelete && !hasKeep) return { decision: "delete", reason };
-  return { decision: "unknown", reason };
+  return results;
 }
 
 async function generateWithRetry(contents: any, deadline: number) {
@@ -194,14 +210,18 @@ async function startServer() {
   // 前端會先把圖片縮到 1024px 的 JPEG，通常只有幾百 KB
   app.use(express.json({ limit: "10mb" }));
 
-  app.post("/api/analyze-slide", async (req, res) => {
-    const { imageBase64, mimeType } = req.body;
+  app.post("/api/analyze-slides", async (req, res) => {
+    const images: { imageBase64?: string; mimeType?: string }[] = Array.isArray(req.body?.images) ? req.body.images : [];
 
-    if (!imageBase64) {
+    if (images.length === 0 || images.some(img => !img?.imageBase64)) {
       return res.status(400).json({ error: "No image provided" });
     }
-    if (mimeType && !ALLOWED_MIME_TYPES.includes(mimeType)) {
-      return res.status(400).json({ error: `Unsupported image type: ${mimeType}` });
+    if (images.length > MAX_BATCH_SIZE) {
+      return res.status(400).json({ error: `Too many images: ${images.length} > ${MAX_BATCH_SIZE}` });
+    }
+    const badType = images.find(img => img.mimeType && !ALLOWED_MIME_TYPES.includes(img.mimeType));
+    if (badType) {
+      return res.status(400).json({ error: `Unsupported image type: ${badType.mimeType}` });
     }
     if (queue.length >= MAX_QUEUE) {
       return res.status(429).json({
@@ -213,19 +233,16 @@ async function startServer() {
     const deadline = Date.now() + MAX_TOTAL_WAIT_MS;
     await acquireSlot();
     try {
-      const response = await generateWithRetry([
-        {
-          text: PROMPT,
-        },
-        {
-          inlineData: {
-            mimeType: mimeType || "image/png",
-            data: imageBase64,
-          },
-        },
-      ], deadline);
+      // 每張圖前面加上編號，讓模型依編號回傳結果
+      const parts: any[] = [{ text: PROMPT }];
+      images.forEach((img, i) => {
+        parts.push({ text: `圖片 ${i + 1}：` });
+        parts.push({ inlineData: { mimeType: img.mimeType || "image/png", data: img.imageBase64 } });
+      });
 
-      res.json(parseDecision(response.text));
+      const response = await generateWithRetry(parts, deadline);
+
+      res.json({ results: parseResults(response.text, images.length) });
     } catch (error: any) {
       console.error("Error analyzing image:", error);
 
