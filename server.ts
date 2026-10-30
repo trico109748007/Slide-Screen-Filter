@@ -16,7 +16,7 @@ const ai = new GoogleGenAI({
 });
 
 // 可用環境變數覆蓋，方便切換模型測試（免費層額度可能因模型而異）
-const MODEL_NAME = process.env.GEMINI_MODEL || "gemini-3.5-flash";
+const MODEL_NAME = process.env.GEMINI_MODEL || "gemini-3.1-flash-lite";
 
 // ---------- 簡易併發限制器 ----------
 // 免費層通常只允許每分鐘個位數~十幾次請求，
