@@ -1,7 +1,7 @@
 import express from "express";
 import path from "path";
 import { createServer as createViteServer } from "vite";
-import { GoogleGenAI } from "@google/genai";
+import { GoogleGenAI, Type } from "@google/genai";
 import dotenv from "dotenv";
 
 dotenv.config();
@@ -50,12 +50,22 @@ function sleep(ms: number) {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
+// SDK 的 ApiError 只有 status 與 message，完整錯誤內容是 message 裡的 JSON 字串
+function parseErrorBody(error: any): any {
+  if (error?.error) return error;
+  try {
+    return JSON.parse(error?.message);
+  } catch {
+    return null;
+  }
+}
+
 // 從 Google 的錯誤訊息中解析 retryDelay（例如 "43.5s" 或 details 裡的 RetryInfo）
 function extractRetryDelayMs(error: any): number | null {
   try {
     const raw =
       error?.retryDelay ??
-      error?.error?.details?.find((d: any) =>
+      parseErrorBody(error)?.error?.details?.find((d: any) =>
         d["@type"]?.includes("RetryInfo")
       )?.retryDelay;
 
@@ -72,16 +82,45 @@ function extractRetryDelayMs(error: any): number | null {
 }
 
 function isRateLimitError(error: any): boolean {
+  const body = parseErrorBody(error);
   return (
     error?.status === 429 ||
-    error?.error?.code === 429 ||
-    error?.error?.status === "RESOURCE_EXHAUSTED"
+    body?.error?.code === 429 ||
+    body?.error?.status === "RESOURCE_EXHAUSTED"
   );
 }
 
 const MAX_RETRIES = Number(process.env.GEMINI_MAX_RETRIES || 4);
+// 單一請求（含排隊與重試等待）的總時間上限，超過就直接回 429，避免 HTTP 請求逾時
+const MAX_TOTAL_WAIT_MS = Number(process.env.GEMINI_MAX_TOTAL_WAIT_MS || 60000);
 
-async function generateWithRetry(contents: any) {
+// 要求模型只回傳 keep / delete，避免自由文字造成判斷錯誤
+const RESPONSE_SCHEMA = {
+  type: Type.OBJECT,
+  properties: {
+    decision: { type: Type.STRING, enum: ["keep", "delete"] },
+  },
+  required: ["decision"],
+};
+
+type Decision = "keep" | "delete" | "unknown";
+
+function parseDecision(text: string | undefined): Decision {
+  const raw = text?.trim() || "";
+  try {
+    const decision = JSON.parse(raw)?.decision;
+    if (decision === "keep" || decision === "delete") return decision;
+  } catch {
+    // 不是 JSON，改用關鍵字判斷
+  }
+  const hasKeep = /保留|keep/i.test(raw);
+  const hasDelete = /刪除|delete/i.test(raw);
+  if (hasKeep && !hasDelete) return "keep";
+  if (hasDelete && !hasKeep) return "delete";
+  return "unknown";
+}
+
+async function generateWithRetry(contents: any, deadline: number) {
   let lastError: any;
 
   for (let attempt = 0; attempt <= MAX_RETRIES; attempt++) {
@@ -89,6 +128,11 @@ async function generateWithRetry(contents: any) {
       return await ai.models.generateContent({
         model: MODEL_NAME,
         contents,
+        config: {
+          temperature: 0,
+          responseMimeType: "application/json",
+          responseSchema: RESPONSE_SCHEMA,
+        },
       });
     } catch (error: any) {
       lastError = error;
@@ -101,13 +145,17 @@ async function generateWithRetry(contents: any) {
       const suggested = extractRetryDelayMs(error);
       const backoff = suggested ?? Math.min(1000 * 2 ** attempt, 30000);
       const jitter = Math.floor(Math.random() * 300);
+      const wait = backoff + jitter;
+
+      // 等下去會超過總時間上限，就不再重試，交給前端稍後處理
+      if (Date.now() + wait > deadline) {
+        throw error;
+      }
 
       console.warn(
-        `[429] 觸發速率限制，第 ${attempt + 1} 次重試前等待 ${
-          backoff + jitter
-        }ms`
+        `[429] 觸發速率限制，第 ${attempt + 1} 次重試前等待 ${wait}ms`
       );
-      await sleep(backoff + jitter);
+      await sleep(wait);
     }
   }
 
@@ -127,14 +175,15 @@ async function startServer() {
       return res.status(400).json({ error: "No image provided" });
     }
 
+    const deadline = Date.now() + MAX_TOTAL_WAIT_MS;
     await acquireSlot();
     try {
       const response = await generateWithRetry([
         {
           text: `你是一個簡報畫面篩選助手。請分析我上傳的圖片，並嚴格遵循以下規則：
-如果畫面是「完整的、放映模式中的投影片/簡報內容」，請回傳 【保留】。
-如果畫面是「PowerPoint編輯介面（有左側縮圖或上方工具列）」、「講師或參與者的視訊露臉畫面」、「多人視訊窗格」、「過場全黑/全灰畫面」，請回傳 【刪除】。
-請不要說任何廢話，只回傳標籤。`,
+如果畫面是「完整的、放映模式中的投影片/簡報內容」，decision 回傳 "keep"。
+如果畫面是「PowerPoint編輯介面（有左側縮圖或上方工具列）」、「講師或參與者的視訊露臉畫面」、「多人視訊窗格」、「過場全黑/全灰畫面」，decision 回傳 "delete"。
+只回傳 JSON，不要其他說明。`,
         },
         {
           inlineData: {
@@ -142,9 +191,9 @@ async function startServer() {
             data: imageBase64,
           },
         },
-      ]);
+      ], deadline);
 
-      res.json({ tag: response.text?.trim() || "" });
+      res.json({ decision: parseDecision(response.text) });
     } catch (error: any) {
       console.error("Error analyzing image:", error);
 
