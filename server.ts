@@ -94,30 +94,52 @@ const MAX_RETRIES = Number(process.env.GEMINI_MAX_RETRIES || 4);
 // 單一請求（含排隊與重試等待）的總時間上限，超過就直接回 429，避免 HTTP 請求逾時
 const MAX_TOTAL_WAIT_MS = Number(process.env.GEMINI_MAX_TOTAL_WAIT_MS || 60000);
 
-// 要求模型只回傳 keep / delete，避免自由文字造成判斷錯誤
+// 要求模型只回傳 keep / delete，避免自由文字造成判斷錯誤；reason 放前面，讓模型先說明再下結論
 const RESPONSE_SCHEMA = {
   type: Type.OBJECT,
   properties: {
+    reason: { type: Type.STRING },
     decision: { type: Type.STRING, enum: ["keep", "delete"] },
   },
-  required: ["decision"],
+  required: ["reason", "decision"],
+  propertyOrdering: ["reason", "decision"],
 };
+
+const PROMPT = `你是簡報截圖篩選助手。請判斷這張截圖是否以「投影片內容」為主體。
+
+保留（keep）：投影片內容佔畫面主要部分。即使畫面上同時出現以下元素，也要保留：
+- 放映視窗的標題列、視窗按鈕或邊框（沒有全螢幕放映）
+- 螢幕分享提示（例如「meet.google.com 正在共用你的畫面」）、會議軟體的浮動工具列或通知
+- 角落的小型講者視訊縮圖
+- 頁碼、浮水印、滑鼠游標、雷射筆、畫面略有裁切或模糊
+
+刪除（delete）：
+- PowerPoint 的「編輯」介面：上方有功能區（常用、插入、設計等分頁與按鈕），或左側有投影片縮圖窗格
+- 以視訊為主的畫面：講者或參與者的臉佔畫面大部分，或多人視訊格狀畫面
+- 幾乎沒有內容的過場畫面：全黑、全灰、全白、載入中
+
+判斷原則：視窗標題列、分享提示這類元素本身不構成刪除理由。無法確定時，傾向保留。
+reason 請用一句繁體中文簡述判斷依據。`;
 
 type Decision = "keep" | "delete" | "unknown";
 
-function parseDecision(text: string | undefined): Decision {
+function parseDecision(text: string | undefined): { decision: Decision; reason: string } {
   const raw = text?.trim() || "";
   try {
-    const decision = JSON.parse(raw)?.decision;
-    if (decision === "keep" || decision === "delete") return decision;
+    const parsed = JSON.parse(raw);
+    const reason = typeof parsed?.reason === "string" ? parsed.reason.slice(0, 200) : "";
+    if (parsed?.decision === "keep" || parsed?.decision === "delete") {
+      return { decision: parsed.decision, reason };
+    }
   } catch {
     // 不是 JSON，改用關鍵字判斷
   }
   const hasKeep = /保留|keep/i.test(raw);
   const hasDelete = /刪除|delete/i.test(raw);
-  if (hasKeep && !hasDelete) return "keep";
-  if (hasDelete && !hasKeep) return "delete";
-  return "unknown";
+  const reason = raw.slice(0, 200);
+  if (hasKeep && !hasDelete) return { decision: "keep", reason };
+  if (hasDelete && !hasKeep) return { decision: "delete", reason };
+  return { decision: "unknown", reason };
 }
 
 async function generateWithRetry(contents: any, deadline: number) {
@@ -179,10 +201,7 @@ async function startServer() {
     try {
       const response = await generateWithRetry([
         {
-          text: `你是一個簡報畫面篩選助手。請分析我上傳的圖片，並嚴格遵循以下規則：
-如果畫面是「完整的、放映模式中的投影片/簡報內容」，decision 回傳 "keep"。
-如果畫面是「PowerPoint編輯介面（有左側縮圖或上方工具列）」、「講師或參與者的視訊露臉畫面」、「多人視訊窗格」、「過場全黑/全灰畫面」，decision 回傳 "delete"。
-只回傳 JSON，不要其他說明。`,
+          text: PROMPT,
         },
         {
           inlineData: {
@@ -192,7 +211,7 @@ async function startServer() {
         },
       ], deadline);
 
-      res.json({ decision: parseDecision(response.text) });
+      res.json(parseDecision(response.text));
     } catch (error: any) {
       console.error("Error analyzing image:", error);
 
