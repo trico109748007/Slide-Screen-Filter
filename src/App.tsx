@@ -6,19 +6,34 @@ import React, { useState, useRef, useEffect } from "react";
 import { Upload, AlertCircle, XCircle } from "lucide-react";
 import { motion, AnimatePresence } from "motion/react";
 
+type Decision = "keep" | "delete" | "unknown";
+
 type ImageFile = {
   id: string;
   file: File;
   previewSrc: string;
   status: "idle" | "loading" | "success" | "error";
-  resultTag: string | null;
+  decision: Decision | null;
   errorMessage: string | null;
 };
+
+const DECISION_LABEL: Record<Decision, string> = {
+  keep: "保留",
+  delete: "刪除",
+  unknown: "待確認",
+};
+
+let nextImageId = 0;
 
 export default function App() {
   const [images, setImages] = useState<ImageFile[]>([]);
   const [isProcessing, setIsProcessing] = useState(false);
   const fileInputRef = useRef<HTMLInputElement>(null);
+  const abortRef = useRef<AbortController | null>(null);
+
+  const updateImage = (id: string, patch: Partial<ImageFile>) => {
+    setImages(prev => prev.map(img => img.id === id ? { ...img, ...patch } : img));
+  };
 
   const handleFileChange = (e: React.ChangeEvent<HTMLInputElement>) => {
     const files = Array.from(e.target.files || []) as File[];
@@ -44,11 +59,11 @@ export default function App() {
     if (imageFiles.length === 0) return;
 
     const newItems: ImageFile[] = imageFiles.map(file => ({
-      id: Math.random().toString(36).substring(7),
+      id: String(nextImageId++),
       file,
       previewSrc: URL.createObjectURL(file),
       status: "idle",
-      resultTag: null,
+      decision: null,
       errorMessage: null,
     }));
 
@@ -94,16 +109,16 @@ export default function App() {
   };
 
   useEffect(() => {
-    const processQueue = async () => {
-      if (isProcessing) return;
-      const nextItemIndex = images.findIndex(img => img.status === "idle");
-      if (nextItemIndex === -1) return;
+    if (isProcessing) return;
+    const item = images.find(img => img.status === "idle");
+    if (!item) return;
 
-      setIsProcessing(true);
-      const item = images[nextItemIndex];
-      
-      setImages(prev => prev.map((img, idx) => idx === nextItemIndex ? { ...img, status: "loading" } : img));
+    const controller = new AbortController();
+    abortRef.current = controller;
+    setIsProcessing(true);
+    updateImage(item.id, { status: "loading" });
 
+    const processItem = async () => {
       try {
         const base64DataUrl = await preprocessImage(item.file);
         const base64Data = base64DataUrl.split(",")[1];
@@ -113,23 +128,33 @@ export default function App() {
           method: "POST",
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify({ imageBase64: base64Data, mimeType }),
+          signal: controller.signal,
         });
 
         if (!response.ok) throw new Error("API Error");
         const data = await response.json();
-        
-        setImages(prev => prev.map((img, idx) => idx === nextItemIndex ? { ...img, status: "success", resultTag: data.tag } : img));
+        if (controller.signal.aborted) return;
+
+        const decision: Decision = data.decision === "keep" || data.decision === "delete" ? data.decision : "unknown";
+        updateImage(item.id, { status: "success", decision });
       } catch (error) {
-        setImages(prev => prev.map((img, idx) => idx === nextItemIndex ? { ...img, status: "error", errorMessage: error instanceof Error ? error.message : "Error" } : img));
+        // 清空列表時取消的請求，結果直接丟掉
+        if (controller.signal.aborted) return;
+        updateImage(item.id, { status: "error", errorMessage: error instanceof Error ? error.message : "Error" });
       } finally {
-        setIsProcessing(false);
+        if (abortRef.current === controller) {
+          abortRef.current = null;
+          setIsProcessing(false);
+        }
       }
     };
 
-    processQueue();
+    processItem();
   }, [images, isProcessing]);
 
   const reset = () => {
+    abortRef.current?.abort();
+    abortRef.current = null;
     setImages([]);
     setIsProcessing(false);
   };
@@ -137,8 +162,9 @@ export default function App() {
   const stats = {
     total: images.length,
     processing: images.filter(i => i.status === 'loading' || i.status === 'idle').length,
-    retained: images.filter(i => i.resultTag?.includes('保留')).length,
-    deleted: images.filter(i => i.resultTag?.includes('刪除')).length,
+    retained: images.filter(i => i.decision === 'keep').length,
+    deleted: images.filter(i => i.decision === 'delete').length,
+    unknown: images.filter(i => i.decision === 'unknown').length,
     errors: images.filter(i => i.status === 'error').length,
   };
 
@@ -219,8 +245,9 @@ export default function App() {
                           initial={{ opacity: 0, scale: 0.9 }}
                           animate={{ opacity: 1, scale: 1 }}
                           className={`relative rounded-lg overflow-hidden border-2 aspect-video bg-black flex items-center justify-center ${
-                            img.status === 'success' && img.resultTag?.includes('保留') ? 'border-green-500' :
-                            img.status === 'success' && img.resultTag?.includes('刪除') ? 'border-red-500' :
+                            img.status === 'success' && img.decision === 'keep' ? 'border-green-500' :
+                            img.status === 'success' && img.decision === 'delete' ? 'border-red-500' :
+                            img.status === 'success' && img.decision === 'unknown' ? 'border-yellow-400' :
                             img.status === 'error' ? 'border-orange-500' :
                             'border-slate-200'
                           }`}
@@ -234,11 +261,13 @@ export default function App() {
                             {img.status === 'loading' && (
                               <div className="w-6 h-6 border-2 border-white border-t-transparent rounded-full animate-spin"></div>
                             )}
-                            {img.status === 'success' && (
+                            {img.status === 'success' && img.decision && (
                               <span className={`text-sm font-bold px-2 py-1 rounded backdrop-blur-md shadow-lg ${
-                                img.resultTag?.includes('保留') ? 'bg-green-500/90 text-white' : 'bg-red-500/90 text-white'
+                                img.decision === 'keep' ? 'bg-green-500/90 text-white' :
+                                img.decision === 'delete' ? 'bg-red-500/90 text-white' :
+                                'bg-yellow-400/90 text-slate-900'
                               }`}>
-                                {img.resultTag}
+                                {DECISION_LABEL[img.decision]}
                               </span>
                             )}
                             {img.status === 'error' && (
@@ -278,6 +307,13 @@ export default function App() {
                      <span className="text-3xl font-black text-red-700">{stats.deleted}</span>
                    </div>
                 </div>
+
+                {(stats.unknown > 0 || stats.errors > 0) && (
+                  <div className="flex gap-4 justify-center text-xs font-bold mb-4">
+                    {stats.unknown > 0 && <span className="text-yellow-600">待確認 {stats.unknown}</span>}
+                    {stats.errors > 0 && <span className="text-orange-500">錯誤 {stats.errors}</span>}
+                  </div>
+                )}
 
                 <div className="w-full bg-slate-100 h-2 rounded-full overflow-hidden mb-6">
                   {stats.total > 0 && (
